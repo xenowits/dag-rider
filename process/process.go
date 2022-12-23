@@ -26,7 +26,7 @@ type vertex struct {
 	weakEdges   []vertexID // A set of vertices in rounds < round − 1 that represent weak edges
 }
 
-func New(ctx context.Context, index, faulty int) (process, error) {
+func New(index, faulty int) (process, error) {
 	// 𝐷𝐴𝐺𝑖 [0] ← predefined hardcoded set of 2𝑓 + 1 “genesis” vertices.
 	// ∀𝑗 ≥ 1: 𝐷𝐴𝐺𝑖 [𝑗] ← {}.
 	// Note that round 0 is a bootstrap (initializer) round, not an actual round.
@@ -45,6 +45,7 @@ func New(ctx context.Context, index, faulty int) (process, error) {
 
 	return process{
 		index:           index,
+		faulty:          faulty,
 		dag:             dag,
 		blocksToPropose: []block{},
 	}, nil
@@ -54,7 +55,7 @@ func New(ctx context.Context, index, faulty int) (process, error) {
 func NewForT(t *testing.T, index, faulty int) process {
 	t.Helper()
 
-	p, err := New(context.Background(), index, faulty)
+	p, err := New(index, faulty)
 	require.NoError(t, err)
 
 	return p
@@ -63,8 +64,10 @@ func NewForT(t *testing.T, index, faulty int) process {
 type process struct {
 	index           int        // Process's index, p_i (1-indexed)
 	round           int        // Current round as registered by this process
+	faulty          int        // No of byzantine faulty processes that are allowed
 	dag             [][]vertex // An array of sets of vertices
 	blocksToPropose []block    // A queue, initially empty, 𝑝𝑖 enqueues valid blocks of transactions from clients
+	buffer          []vertex
 }
 
 // path checks if there exists a path consisting of strong and weak edges in the DAG. If the strongPath boolean is set to true, only strong
@@ -123,6 +126,82 @@ func (p process) path(from, to vertexID, strongPath bool) bool {
 					visited[temp] = true
 					queue = append(queue, temp)
 				}
+			}
+		}
+	}
+
+	return false
+}
+
+// Always is meant to be run as a goroutine by the caller process.
+func (p process) Always() {
+	// Each process 𝑝𝑖 continuously goes through its buffer to check if there is a vertex 𝑣
+	// in it that can be added to its 𝐷𝐴𝐺i.
+	for true {
+		var newBuffer []vertex
+		for _, v := range p.buffer {
+			if v.id.round > p.round {
+				newBuffer = append(newBuffer, v)
+				continue
+			}
+
+			var absentPre bool
+			// Check if all of v's predecessors are present in the DAG.
+			for _, pre := range v.strongEdges {
+				if !p.present(pre) {
+					absentPre = true
+					log.Debug(context.Background(), "strong predecessor not present", z.Any("pre", pre), z.Any("current", v.id))
+					break
+				}
+			}
+			for _, pre := range v.weakEdges {
+				if !p.present(pre) {
+					absentPre = true
+					log.Debug(context.Background(), "weak predecessor not present", z.Any("pre", pre), z.Any("current", v.id))
+					break
+				}
+			}
+
+			if absentPre { // The vertex cannot be processed so added to the next buffer
+				newBuffer = append(newBuffer, v)
+			} else { // All predecessors present
+				// Add the vertex to DAG.
+				p.dag[v.id.round] = append(p.dag[v.id.round], v)
+			}
+		}
+
+		p.buffer = newBuffer
+	}
+
+	if len(p.dag[p.round]) >= 2*p.faulty+1 { // Start a new round
+		// If a new wave is complete, signal to Algorithm 3 that a new wave is complete.
+		if p.round%4 == 0 {
+			p.waveReady()
+		}
+
+		p.round = p.round + 1
+		v := p.createNewVertex(p.round)
+		p.reliableBroadcast(v, p.round)
+	}
+}
+
+// reliableBroadcast reliably broadcasts the provided vertex to other processes. TODO(xenowits): Complete this method.
+func (p process) reliableBroadcast(v vertex, round int) {}
+
+// createNewVertex creates a new vertex to be added to the DAG. TODO(xenowits): Complete this method.
+func (p process) createNewVertex(round int) vertex {
+	return vertex{}
+}
+
+// TODO(xenowits): Complete this method.
+func (p process) waveReady() {}
+
+// present returns true if the provided vertex is present in the process's local DAG.
+func (p process) present(vID vertexID) bool {
+	for r := 0; r <= p.round; r++ {
+		for _, v := range p.dag[r] {
+			if v.id == vID {
+				return true
 			}
 		}
 	}
