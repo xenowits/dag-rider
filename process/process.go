@@ -10,7 +10,9 @@ import (
 )
 
 // block is a block of transactions.
-type block struct{}
+type block struct {
+	data []byte
+}
 
 // vertexID is a unique identifier for a vertex. The round and source uniquely identifies a vertex in a DAG.
 type vertexID struct {
@@ -67,7 +69,7 @@ type process struct {
 	faulty          int        // No of byzantine faulty processes that are allowed
 	dag             [][]vertex // An array of sets of vertices
 	blocksToPropose []block    // A queue, initially empty, 𝑝𝑖 enqueues valid blocks of transactions from clients
-	buffer          []vertex
+	buffer          []vertex   // Buffer contains vertices that are ultimately added to the DAG
 }
 
 // path checks if there exists a path consisting of strong and weak edges in the DAG. If the strongPath boolean is set to true, only strong
@@ -188,9 +190,47 @@ func (p process) Always() {
 // reliableBroadcast reliably broadcasts the provided vertex to other processes. TODO(xenowits): Complete this method.
 func (p process) reliableBroadcast(v vertex, round int) {}
 
-// createNewVertex creates a new vertex to be added to the DAG. TODO(xenowits): Complete this method.
+// createNewVertex creates a new vertex to be added to the DAG.
 func (p process) createNewVertex(round int) vertex {
-	return vertex{}
+	// 17: wait until ¬blocksToPropose.empty() ⊲ atomic broadcast blocks are enqueued (Line 32)
+	// 18: 𝑣.block ← blocksToPropose.dequeue() ⊲ We assume each process atomically broadcast infinitely many blocks
+	// 19: 𝑣.strongEdges ← 𝐷𝐴𝐺 [round − 1]
+	// 20: set_weak_edges(𝑣,round)
+	// 21: return v
+
+	for len(p.blocksToPropose) == 0 {
+		// Wait for some enqueued blocks.
+	}
+
+	var resp vertex
+	// Dequeue block.
+	b := p.blocksToPropose[0]
+	p.blocksToPropose = p.blocksToPropose[1:]
+
+	// Add block and strong edges to the new vertex.
+	resp.block = b
+	for _, v := range p.dag[round-1] {
+		resp.strongEdges = append(resp.strongEdges, v.id)
+	}
+
+	// Set weak edges.
+	p.setWeakEdges(&resp, round)
+
+	return resp
+}
+
+// setWeakEdges adds weak edges to orphan vertices.
+func (p process) setWeakEdges(v *vertex, round int) {
+	// 29: for 𝑟 = round − 2 down to 1 do
+	// 30: for every 𝑢 ∈ 𝐷𝐴𝐺𝑖 [𝑟] s.t. ¬path(𝑣, 𝑢) do
+	// 31: 𝑣.weakEdges ← 𝑣.weakEdges ∪ {𝑢}
+	for r := round - 2; r >= 1; r-- {
+		for _, vtemp := range p.dag[r] {
+			if !p.path(v.id, vtemp.id, false) {
+				v.weakEdges = append(v.weakEdges, vtemp.id)
+			}
+		}
+	}
 }
 
 // TODO(xenowits): Complete this method.
