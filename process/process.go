@@ -6,6 +6,7 @@ import (
 	"github.com/obolnetwork/charon/app/log"
 	"github.com/obolnetwork/charon/app/z"
 	"github.com/stretchr/testify/require"
+	"sync"
 	"testing"
 )
 
@@ -28,6 +29,7 @@ type vertex struct {
 	weakEdges   []vertexID // A set of vertices in rounds < round − 1 that represent weak edges
 }
 
+// New instantiates a new process. TODO(xenowits): Update this function.
 func New(index, faulty int) (process, error) {
 	// 𝐷𝐴𝐺𝑖 [0] ← predefined hardcoded set of 2𝑓 + 1 “genesis” vertices.
 	// ∀𝑗 ≥ 1: 𝐷𝐴𝐺𝑖 [𝑗] ← {}.
@@ -64,6 +66,9 @@ func NewForT(t *testing.T, index, faulty int) process {
 }
 
 type process struct {
+	mu              sync.Mutex
+	quit            chan struct{}
+	tp              Transport
 	index           int        // Process's index, p_i (1-indexed)
 	round           int        // Current round as registered by this process
 	faulty          int        // No of byzantine faulty processes that are allowed
@@ -135,7 +140,53 @@ func (p process) path(from, to vertexID, strongPath bool) bool {
 	return false
 }
 
-// Always is meant to be run as a goroutine by the caller process.
+// Start invokes the goroutines and starts the process.
+func (p process) Start() {
+	// 22: upon r_deliver𝑖 (𝑣, round, 𝑝𝑘) do ⊲ The deliver output from the reliable broadcast
+	// 23: 𝑣.source ← 𝑝𝑘
+	// 24: 𝑣.round ← round
+	// 25: if |𝑣.strongEdges| ≥ 2𝑓 + 1 then
+	// 26: buffer ← buffer ∪ {𝑣 }
+	uponDeliver := func(msg *bcastMsg) {
+		msg.v.id = vertexID{
+			round:  msg.round,
+			source: msg.sender,
+		}
+
+		p.mu.Lock()
+		if len(msg.v.strongEdges) >= 2*p.faulty+1 {
+			p.buffer = append(p.buffer, msg.v)
+		}
+		p.mu.Unlock()
+	}
+
+	// Creating a buffered channel as theoretically, each process broadcasts infinitely many
+	// messages with consecutive sequence numbers.
+	// A goroutine is started which will accept all broadcast messages.
+	ch := make(chan bcastMsg, 10)
+	go func() {
+		for {
+			select {
+			case <-p.quit:
+				return
+			case msg := <-ch:
+				uponDeliver(&msg)
+			}
+		}
+	}()
+
+	p.tp.Subscribe(ch)
+}
+
+// Stop stops the process.
+func (p process) Stop() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	close(p.quit)
+}
+
+// Always is meant to be run as a goroutine by the caller process. TODO(xenowits): Can we merge with Start()?
 func (p process) Always() {
 	// Each process 𝑝𝑖 continuously goes through its buffer to check if there is a vertex 𝑣
 	// in it that can be added to its 𝐷𝐴𝐺i.
