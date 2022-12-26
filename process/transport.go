@@ -8,8 +8,8 @@ type Transport struct {
 	subs []chan<- bcastMsg
 }
 
-// bcastMsg is the message that is broadcasted by the sending process. This message is meant to be
-// delivered to each process.
+// bcastMsg is the message that is broadcasted by the sending Process. This message is meant to be
+// delivered to each Process.
 type bcastMsg struct {
 	v      vertex
 	round  int
