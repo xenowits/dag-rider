@@ -309,7 +309,8 @@ func (p Process) setWeakEdges(v *vertex, round int) {
 	}
 }
 
-// waveReady is a signal from the DAG layer that a new wave is completed. TODO(xenowits): Complete this method.
+// waveReady is a signal from the DAG layer that a new wave is completed.
+// TODO(xenowits): Fix concurrency issues.
 func (p Process) waveReady(wave int) {
 	// 35: 𝑣 ← get_wave_vertex_leader(𝑤)
 	// 36: if 𝑣 = ⊥ ∨ | {𝑣′ ∈ 𝐷𝐴𝐺𝑖 [round(𝑤,4)]: strong_path(𝑣′, 𝑣)} | < 2𝑓 + 1 then ⊲ No commit
