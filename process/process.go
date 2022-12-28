@@ -6,6 +6,7 @@ import (
 	"github.com/obolnetwork/charon/app/log"
 	"github.com/obolnetwork/charon/app/z"
 	"github.com/stretchr/testify/require"
+	"github.com/xenowits/dag-rider/stack"
 	"sync"
 	"testing"
 )
@@ -69,15 +70,18 @@ func NewForT(t *testing.T, index, faulty int, tp *Transport) *Process {
 }
 
 type Process struct {
-	mu              sync.Mutex
-	quit            chan struct{}
-	tp              *Transport
-	index           int        // Process's index, p_i (1-indexed)
-	round           int        // Current round as registered by this Process
-	faulty          int        // No of byzantine faulty processes that are allowed
-	dag             [][]vertex // An array of sets of vertices
-	blocksToPropose []block    // A queue, initially empty, 𝑝𝑖 enqueues valid blocks of transactions from clients
-	buffer          []vertex   // Buffer contains vertices that are ultimately added to the DAG
+	mu                sync.Mutex
+	quit              chan struct{}
+	tp                *Transport
+	index             int        // Process's index, p_i (1-indexed)
+	round             int        // Current round as registered by this Process
+	faulty            int        // No of byzantine faulty processes that are allowed
+	dag               [][]vertex // An array of sets of vertices
+	blocksToPropose   []block    // A queue, initially empty, 𝑝𝑖 enqueues valid blocks of transactions from clients
+	buffer            []vertex   // Buffer contains vertices that are ultimately added to the DAG
+	decidedWave       int
+	deliveredVertices []vertex
+	leadersStack      stack.Stack[vertex] // Stack of leader vertices
 }
 
 // path checks if there exists a path consisting of strong and weak edges in the DAG. If the strongPath boolean is set to true, only strong
@@ -143,7 +147,7 @@ func (p Process) path(from, to vertexID, strongPath bool) bool {
 	return false
 }
 
-// Start invokes the goroutines and starts the process.
+// Start invokes the goroutines and starts the process. TODO(xenowits): fix concurrency issue in this function.
 func (p Process) Start() {
 	// Start one goroutine to listen for braodcast messages.
 	// 22: upon r_deliver𝑖 (𝑣, round, 𝑝𝑘) do ⊲ The deliver output from the reliable broadcast
@@ -232,7 +236,7 @@ func (p Process) Start() {
 	if len(p.dag[p.round]) >= 2*p.faulty+1 { // Start a new round
 		// If a new wave is complete, signal to Algorithm 3 that a new wave is complete.
 		if p.round%4 == 0 {
-			p.waveReady()
+			p.waveReady(p.round / 4)
 		}
 
 		p.round = p.round + 1
@@ -305,8 +309,66 @@ func (p Process) setWeakEdges(v *vertex, round int) {
 	}
 }
 
-// TODO(xenowits): Complete this method.
-func (p Process) waveReady() {}
+// waveReady is a signal from the DAG layer that a new wave is completed.
+// TODO(xenowits): Fix concurrency issues.
+func (p Process) waveReady(wave int) {
+	// 35: 𝑣 ← get_wave_vertex_leader(𝑤)
+	// 36: if 𝑣 = ⊥ ∨ | {𝑣′ ∈ 𝐷𝐴𝐺𝑖 [round(𝑤,4)]: strong_path(𝑣′, 𝑣)} | < 2𝑓 + 1 then ⊲ No commit
+	// 37: return
+	// 38: leadersStack.push(𝑣)
+	// 39: for wave 𝑤′ from 𝑤 − 1 down to decidedWave + 1 do
+	// 40: 𝑣′ ← get_wave_vertex_leader(𝑤′)
+	// 41: if 𝑣′ ≠ ⊥ ∧ strong_path(𝑣, 𝑣′) then
+	// 42: leadersStack.push(𝑣′)
+	// 43: 𝑣 ← 𝑣′
+	// 44: decidedWave ← 𝑤
+	// 45: order_vertices(leadersStack)
+	leader, ok := p.getWaveVertexLeader(wave)
+	if !ok {
+		return
+	}
+
+	var vCount int
+	for _, v := range p.dag[waveRound(wave, 4)] {
+		if p.path(v.id, leader.id, true) {
+			vCount++
+		}
+	}
+	if vCount < 2*p.faulty+1 {
+		return
+	}
+
+	p.leadersStack.Push(leader)
+	for w := wave - 1; w >= p.decidedWave+1; w-- {
+		v, ok := p.getWaveVertexLeader(w)
+		if !ok || !p.path(leader.id, v.id, true) {
+			continue
+		}
+
+		p.leadersStack.Push(v)
+		leader = v
+	}
+
+	p.decidedWave = wave
+
+}
+
+// getWaveVertexLeader returns the leader vertex for the wave if found.
+func (p Process) getWaveVertexLeader(w int) (vertex, bool) {
+	// 47: 𝑝𝑗 ← choose_leader𝑖 (𝑤)
+	// 48: if ∃𝑣 ∈ 𝐷𝐴𝐺 [round(𝑤, 1) ] s.t. 𝑣.𝑠𝑜𝑢𝑟𝑐𝑒 = 𝑝𝑗 then
+	// 49: return 𝑣 ⊲ There can only be one such vertex
+	// 50: return ⊥
+	leader := chooseLeader(w)
+	round := waveRound(w, 1)
+	for _, v := range p.dag[round] {
+		if v.id.source == leader {
+			return v, true
+		}
+	}
+
+	return vertex{}, false
+}
 
 // present returns true if the provided vertex is present in the Process's local DAG.
 func (p Process) present(vID vertexID) bool {
@@ -319,4 +381,63 @@ func (p Process) present(vID vertexID) bool {
 	}
 
 	return false
+}
+
+// chooseLeader implements a global perfect coin which is unpredictable by the adversary.
+// The coin guarantees these properties: agreement, termination, unpredictability and fairness.
+// TODO(xenowits): One way to implement a global perfect coin is by using PKI and a threshold signature scheme with a threshold of (𝑓 + 1)-of-𝑛.
+// For simplicity of implementation, we're return process 1 as the leader everytime.
+func chooseLeader(w int) int {
+	return 1
+}
+
+// waveRound returns the round given the wave and k.
+// For example, 𝑝𝑖’s first wave consists of 𝐷𝐴𝐺𝑖 [1], 𝐷𝐴𝐺𝑖 [2], 𝐷𝐴𝐺𝑖 [3], and 𝐷𝐴𝐺𝑖 [4]. Formally, the 𝑘𝑡ℎ round of wave 𝑤,
+// where 𝑘 ∈ [1..4], 𝑤 ∈ N, is defined as round(𝑤, 𝑘) ≜ 4(𝑤 − 1) + 𝑘.
+// We also say that a process 𝑝𝑖 completes round 𝑟 once 𝐷𝐴𝐺𝑖 [𝑟] has at least 2𝑓 + 1 vertices, and a
+// process completes wave 𝑤 once the process completes round(𝑤, 4). In a nutshell,
+// the idea is to interpret the DAG as a wave-bywave protocol and try to commit a randomly chosen single leader vertex in every wave.
+func waveRound(w, k int) int {
+	return 4*(w-1) + k
+}
+
+func (p Process) orderVertices() {
+	// 51: procedure order_vertices(leadersStack)
+	// 52: while ¬leadersStack.isEmpty() do
+	// 53: 𝑣 ← leadersStack.pop()
+	// 54: verticesToDeliver ← {𝑣′ ∈ Ð 𝑟 >0 𝐷𝐴𝐺𝑖 [𝑟] | 𝑝𝑎𝑡ℎ(𝑣, 𝑣′) ∧ 𝑣′ ∉ deliveredVertices}
+	// 55: for every 𝑣′ ∈ verticesToDeliver in some deterministic order do
+	// 56: output a_deliver𝑖 (𝑣′.block, 𝑣′.round, 𝑣′.source)
+	// 57: deliveredVertices ← deliveredVertices ∪ {𝑣′}
+	for !p.leadersStack.IsEmpty() {
+		poppedVertex := p.leadersStack.Pop()
+		currRound := p.round
+
+		var verticesToDeliver []vertex
+		for r := 1; r <= currRound; r++ {
+			for _, temp := range p.dag[r] {
+				if !p.path(poppedVertex.id, temp.id, false) { // A path should exist between the vertices
+					continue
+				}
+
+				for _, deliveredVertex := range p.deliveredVertices {
+					if temp.id == deliveredVertex.id { // The vertex should not be already delivered
+						continue
+					}
+				}
+
+				verticesToDeliver = append(verticesToDeliver, temp)
+			}
+		}
+
+		for _, v := range verticesToDeliver { // The order should be deterministic
+			msg := bcastMsg{
+				v:      v,
+				round:  v.id.round,
+				sender: v.id.source,
+			}
+			p.tp.Broadcast(msg)
+			p.deliveredVertices = append(p.deliveredVertices, v)
+		}
+	}
 }
